@@ -1,0 +1,143 @@
+#!/bin/bash
+
+set -e
+
+trap cleanup EXIT
+
+tmpfile=$(mktemp)
+volume_name="data"
+mount_point="/$${volume_name}"
+
+cleanup() {
+    rm -f "$${tmpfile}"
+}
+
+fetch_decryption_key() {
+    curl -s -H 'X-Auth-Token: ${access_token}' 'https://api.scaleway.com/secret-manager/v1alpha1/regions/${region}/secrets/${secret_id}/versions/latest/access'| jq -r '.data' | base64 -d > "$${tmpfile}"
+}
+
+create_decryption_script() {
+    cat <<-EOF > /usr/local/bin/get-encryption-key.sh
+	#!/bin/bash
+
+	set -e
+
+	curl -s -H 'X-Auth-Token: ${access_token}' "https://api.scaleway.com/secret-manager/v1beta1/regions/${region}/secrets/${secret_id}/versions/latest/access" | jq -r '.data' | base64 -d
+EOF
+
+    if [ -e "/usr/local/bin/get-encryption-key.sh" ]
+    then
+        chmod 500 /usr/local/bin/get-encryption-key.sh
+    fi
+}
+
+if [ -e "/partition_done" ]
+then
+    echo "Partitionning has already been done"
+    exit 0
+fi
+
+create_systemd_units() {
+    local array="$1"
+    cat <<-EOF > /etc/systemd/system/unlock-$volume_name-volume.service
+	[Unit]
+	Description=Open encrypted volume $volume_name
+	After=network-online.target
+	Wants=network-online.target
+	StopWhenUnneeded=true
+	StartLimitBurst=15
+	StartLimitIntervalSec=30
+
+	[Service]
+	Type=oneshot
+	ExecStart=/bin/sh -c "/usr/local/bin/get-encryption-key.sh | /sbin/cryptsetup -d - -v luksOpen $array $volume_name"
+	RemainAfterExit=true
+	ExecStop=/sbin/cryptsetup -d - -v luksClose $volume_name
+	Restart=on-failure
+	RestartSec=2
+	TimeoutStartSec=180
+EOF
+
+    cat <<-EOF > /etc/systemd/system/"$${mount_point}".mount
+	[Unit]
+	Requires=unlock-$${volume_name}-volume.service
+	After=unlock-$${volume_name}-volume.service
+
+	[Mount]
+	What=/dev/mapper/$${volume_name}
+	Where=$${mount_point}
+	Type=ext4
+	Options=defaults,_netdev
+
+	[Install]
+	WantedBy=remote-fs.target
+EOF
+
+    # Create drop-in configuration for the device unit to increase job running timeout
+    mkdir -p /etc/systemd/system/dev-mapper-$${volume_name}.device.d
+    cat <<-EOF > /etc/systemd/system/dev-mapper-$${volume_name}.device.d/timeout.conf
+	[Unit]
+	JobRunningTimeoutSec=180
+EOF
+}
+
+# Create the partition_done file
+touch /partition_done
+
+if ! dpkg --get-selections | grep -q "^cryptsetup"
+then
+    apt-get -q -y --no-install-recommends install cryptsetup jq
+fi
+
+if cryptsetup status "$${volume_name}" > /dev/null 2>&1
+then
+    echo "volume $${volume_name} present, aborting"
+    exit 1
+fi
+
+# looking for raid array not mounted
+volume_found=0
+while read raid_volume
+do
+    if ! echo $${raid_volume} | grep -q ext4
+    then
+        volume_found=1
+        break
+    fi
+done < <(lsblk -ln -o name,fstype | grep -F md)
+
+if [ "$${volume_found}" -eq 0 ]
+then
+    echo "No RAID volume found to partition"
+    exit 1
+fi
+
+fetch_decryption_key
+# Formatting Raid array found
+raid_array=$(echo "$${raid_volume}" | cut -d' ' -f 1)
+if ! cryptsetup luksFormat -q "/dev/$${raid_array}" "$${tmpfile}"
+then
+    echo "Fail to create encrypted volume on /dev/$raid_array"
+    exit 1
+fi
+
+# attach newly encrypted volume
+if ! cryptsetup luksOpen --key-file "$${tmpfile}" /dev/$${raid_array} $${volume_name}
+then
+    echo "Fail to attach encrypted volume $${volume_name} on /dev/$${raid_array}"
+    exit 1
+fi
+
+if ! mkfs.ext4 -L "$${volume_name}" -q /dev/mapper/$${volume_name}
+then
+    echo "Fail to format encrypted volume $${volume_name} on /dev/$${raid_array}"
+    exit 1
+fi
+
+create_decryption_script
+create_systemd_units "/dev/$${raid_array}"
+if [ "$?" = "0" ]
+then
+    systemctl daemon-reload
+    systemctl enable data.mount
+fi
